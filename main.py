@@ -5,18 +5,17 @@ Re-implementation of
 with two key changes:
 
 1.  Non-STAB coverage: A Pokémon is assumed to have at least one neutral
-    attacking option (1×) even when none of its own types are useful.
+    attacking option (1x) even when none of its own types are useful.
 
 2.  Defensive weighting:  Incoming damage is multiplied by DEF_WT (≥1) before
     the payoff is computed.  DEF_WT > 1 rewards combinations whose resistances
     matter more than their super-effective coverage.
 
-Author:  Kian (<your Git username>) – 2025-05-09
+Author:  Kian (<your Git username>) - 2025-05-09
 """
 
 import itertools
 import numpy as np
-import nashpy as nash
 
 # ---------------------------------------------------------------------
 # 1. The modern 18-type chart
@@ -29,11 +28,11 @@ TYPES = [
     "Rock", "Ghost", "Dragon", "Dark", "Steel", "Fairy"
 ]
 
-# Everything that is not listed is 1×
+# Everything that is not listed is 1x
 IMMUNE   = {("Normal", "Ghost"), ("Fighting", "Ghost"), ("Psychic", "Dark"),
             ("Poison", "Steel"), ("Electric", "Ground"), ("Ground", "Flying"),
             ("Dragon", "Fairy")}
-NOT_VERY = { # ½×
+NOT_VERY = { # ½x
     ("Normal", "Rock"), ("Normal", "Steel"),
     ("Fire", "Fire"), ("Fire", "Water"), ("Fire", "Rock"), ("Fire", "Dragon"),
     ("Water", "Water"), ("Water", "Grass"), ("Water", "Dragon"),
@@ -57,7 +56,7 @@ NOT_VERY = { # ½×
     ("Steel", "Fire"), ("Steel", "Water"), ("Steel", "Electric"), ("Steel", "Steel"),
     ("Fairy", "Fire"), ("Fairy", "Poison"), ("Fairy", "Steel"),
 }
-SUPER    = { # 2×
+SUPER    = { # 2x
     ("Fire", "Grass"), ("Fire", "Ice"), ("Fire", "Bug"), ("Fire", "Steel"),
     ("Water", "Fire"), ("Water", "Ground"), ("Water", "Rock"),
     ("Electric", "Water"), ("Electric", "Flying"),
@@ -80,7 +79,7 @@ SUPER    = { # 2×
 }
 
 def mult(attack, defend):
-    """Return the type effectiveness multiplier (float) for one‐on‐one."""
+    """Return the type effectiveness multiplier (float) for one-on-one."""
     if (attack, defend) in IMMUNE:
         return 0.0
     if (attack, defend) in NOT_VERY:
@@ -94,9 +93,7 @@ def mult(attack, defend):
 #    Order is alphabetical purely for reproducibility
 # ---------------------------------------------------------------------
 
-COMBOS = []
-for a, b in itertools.combinations_with_replacement(TYPES, 2):
-    COMBOS.append((a, b))
+COMBOS = list(itertools.combinations_with_replacement(TYPES, 2))
 
 INDEX = {c: i for i, c in enumerate(COMBOS)}
 
@@ -105,23 +102,33 @@ INDEX = {c: i for i, c in enumerate(COMBOS)}
 #    DEF_WT > 1 ⇒ defense matters more (incoming hits “hurt” more)
 # ---------------------------------------------------------------------
 
-DEF_WT       = 1.5          # try 1.0 (original), 1.5, 2.0 …
-N_ITERATIONS = 30           # number of random starts for equilibrium search
-RNG_SEED     = 42
+DEF_WT       = 1.0         # try 1.0 (original), 1.5, 2.0 …
 
 # ---------------------------------------------------------------------
 # 4. Helper: best attack a combo can throw at a defender
-#    Non-STAB coverage rule: floor at 1×
+#    Non-STAB coverage rule: floor at 1x
 # ---------------------------------------------------------------------
 
 def best_attack(attacker, defender):
     a1, a2 = attacker
     d1, d2 = defender
-    effs = [
-        mult(a1, d1) * mult(a1, d2),
-        mult(a2, d1) * mult(a2, d2) if a2 != a1 else 0,
-    ]
-    return max(max(effs), 1.0)   # ≥ 1× because of coverage
+
+    def eff(atk):
+        """STAB-boosted effectiveness of one attacking type."""
+        mult1 = mult(atk, d1)
+        # If the defender’s two slots are the *same* (Water/Water, Ghost/Ghost, …)
+        # don’t multiply the chart bonus twice – it would inflate to 4×.
+        mult2 = mult(atk, d2) if d2 != d1 else 1.0
+        return 1.5 * mult1 * mult2
+
+    stab1 = eff(a1)
+
+    # Avoid doing the same calculation twice for monotypes like (Water, Water)
+    stab2 = eff(a2) if a2 != a1 else 0.0
+
+    coverage = 1.5          # always available neutral move
+
+    return max(stab1, stab2, coverage)
 
 # ---------------------------------------------------------------------
 # 5. Build payoff matrix with defensive weighting
@@ -151,31 +158,42 @@ for i, c_i in enumerate(COMBOS):
         M[i, j] = score
         M[j, i] = -score  # antisymmetric by construction
 
-# ---------------------------------------------------------------------
-# 6. Compute an empirical mixed-strategy Nash equilibrium
-#    We do multiple random restarts because the matrix is huge (324×324)
-# ---------------------------------------------------------------------
+# ---------- 6. Compute a mixed-strategy Nash equilibrium (fast LP) ----------
+from scipy.optimize import linprog
 
-np.random.seed(RNG_SEED)
-agg_probs = np.zeros(len(COMBOS), dtype=float)
+N = len(COMBOS)
 
-for _ in range(N_ITERATIONS):
-    A = nash.Game(M)
-    sigma_i, sigma_j = A.support_enumeration().__next__()
-    # Any two-player zero-sum equilibrium gives identical row/col strategies
-    agg_probs += sigma_i
+# Variables: p_0 … p_{N-1}  and  v  (the game value)
+# We'll maximise v, so minimise -v.
+c = np.zeros(N + 1)
+c[-1] = -1                         # minimise -v  ⇔  maximise v
 
-avg_probs = agg_probs / N_ITERATIONS
+# Inequalities:   M^T p  ≥  v·1   ⇒   -M^T p + v·1 ≤ 0
+A_ub = np.hstack([-M.T, np.ones((N, 1))])
+b_ub = np.zeros(N)
+
+# Equalities: probabilities sum to 1
+A_eq = np.hstack([np.ones((1, N)), [[0]]])
+b_eq = [1]
+
+bounds = [(0, None)] * N + [(None, None)]   # p_i ≥ 0,  v free
+
+res = linprog(c, A_ub, b_ub, A_eq, b_eq, method="highs", options={"disp": False})
+if not res.success:
+    raise RuntimeError(res.message)
+
+sigma = res.x[:-1]               # the equilibrium distribution
+game_value = res.x[-1]
 
 # ---------------------------------------------------------------------
 # 7. Rank the combinations
 # ---------------------------------------------------------------------
 
 ranking = sorted(
-    ((COMBOS[i], p) for i, p in enumerate(avg_probs) if p > 0),
+    ((COMBOS[i], p) for i, p in enumerate(sigma) if p > 0),
     key=lambda x: -x[1]
 )
 
 print(f"Top {len(ranking)} type combinations (DEF_WT={DEF_WT}):")
 for (t1, t2), p in ranking[:27]:        # 27 for easy comparison with Schmitz
-    print(f"{t1}/{t2:<7}  –  {p:.4f}")
+    print(f"{t1}/{t2:<7}  -  {p:.4f}")
